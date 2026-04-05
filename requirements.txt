@@ -4,3 +4,5 @@ python-multipart==0.0.6
 pillow>=10.2.0
 google-cloud-aiplatform>=1.38.0
 python-dotenv
+PyMuPDF>=1.24.0
+numpy>=1.26.0

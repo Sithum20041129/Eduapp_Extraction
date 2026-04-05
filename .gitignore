@@ -9,10 +9,10 @@ node_modules/
 
 # Environment files
 .env
-
+.claude
 # OS
 .DS_Store
-
+.claude\settings.local.json
 list_models.py
 # Service Account Key
 service-account-key.json

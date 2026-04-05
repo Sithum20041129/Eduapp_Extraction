@@ -99,3 +99,44 @@ class ModelLoader:
                 'image_included': image_included
             }
             return f"Error generating content: {e}", error_metadata
+
+    def predict_with_parts(self, parts: list, prompt_text: str):
+        """
+        Send arbitrary Part objects (e.g. PDFs) + prompt to the model.
+        
+        Args:
+            parts: List of vertexai Part objects (PDF bytes, images, etc.)
+            prompt_text: The prompt to send with the parts
+            
+        Returns:
+            Tuple of (response_text, usage_metadata)
+        """
+        model = self.get_model()
+        inputs = [prompt_text] + parts
+        
+        try:
+            response = model.generate_content(inputs)
+            usage_metadata = {
+                'prompt_token_count': getattr(response.usage_metadata, 'prompt_token_count', 0),
+                'candidates_token_count': getattr(response.usage_metadata, 'candidates_token_count', 0),
+                'total_token_count': getattr(response.usage_metadata, 'total_token_count', 0),
+                'image_included': True
+            }
+            # Extract text from all parts (response.text fails with multi-part responses)
+            try:
+                text = response.text
+            except Exception:
+                # Manually concatenate text from all candidate parts
+                text = ""
+                for part in response.candidates[0].content.parts:
+                    if hasattr(part, 'text') and part.text:
+                        text += part.text
+            return text, usage_metadata
+        except Exception as e:
+            error_metadata = {
+                'prompt_token_count': 0,
+                'candidates_token_count': 0,
+                'total_token_count': 0,
+                'image_included': True
+            }
+            return f"Error generating content: {e}", error_metadata

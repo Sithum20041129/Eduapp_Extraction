@@ -4,9 +4,11 @@ from typing import Optional, List
 import uvicorn
 from model_loader import ModelLoader
 from token_logger import token_logger
+from vertexai.generative_models import Part
 from PIL import Image
 import io
 import os
+import base64
 
 # Subject-specific extraction prompts for better accuracy
 SUBJECT_PROMPTS = {
@@ -264,6 +266,515 @@ async def extract_text_batch(
     except HTTPException:
         raise
     except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class ParsedQuestion(BaseModel):
+    questionNumber: int
+    text: str
+    type: str  # "MCQ" or "ESSAY"
+    marks: Optional[int] = None
+    options: Optional[List[dict]] = None  # [{"text": "...", "isCorrect": true/false}]
+    modelAnswer: Optional[str] = None
+    startPage: Optional[int] = None  # 1-indexed page number where question starts
+    endPage: Optional[int] = None    # 1-indexed page number where question ends
+
+class PaperExtractionResponse(BaseModel):
+    questions: List[ParsedQuestion]
+    totalQuestions: int
+    paperTitle: Optional[str] = None
+    questionImages: Optional[List[Optional[str]]] = None  # base64 PNG - one per question (null if failed)
+
+
+@app.post("/extract-paper", response_model=PaperExtractionResponse)
+async def extract_paper(
+    questionPaper: UploadFile = File(...),
+    answerPaper: Optional[UploadFile] = File(None),
+    subject: Optional[str] = Form(None),
+    lesson: Optional[str] = Form(None),
+    paperType: Optional[str] = Form("MIXED"),
+    defaultMarks: Optional[int] = Form(1)
+):
+    """
+    Extract structured questions from a PDF question paper.
+    Optionally accepts an answer paper PDF to pair model answers with questions.
+    
+    Returns a JSON list of parsed questions with text, type, marks, options, and answers.
+    """
+    try:
+        import json as json_module
+
+        print("=" * 60)
+        print("[PAPER EXTRACTION] === RECEIVED PARAMS ===")
+        print(f"  subject: '{subject}'")
+        print(f"  lesson: '{lesson}'")
+        print(f"  paperType: '{paperType}'")
+        print(f"  defaultMarks: {defaultMarks}")
+        print(f"  questionPaper: {questionPaper.filename} ({questionPaper.content_type})")
+        print(f"  answerPaper: {answerPaper.filename if answerPaper else 'None'}")
+        print("=" * 60)
+
+        # Read PDF bytes
+        question_bytes = await questionPaper.read()
+        
+        # Determine mime type
+        q_mime = questionPaper.content_type or "application/pdf"
+        if not q_mime.startswith("application/pdf") and not q_mime.startswith("image/"):
+            raise HTTPException(status_code=400, detail="Question paper must be a PDF or image file")
+
+        # Convert PDF pages to PIL images, collect text blocks and vector drawings
+        page_pil_images = []    # PIL Images (RGB), one per page
+        page_text_data  = []    # Text blocks per page (for question boundary + compaction)
+        page_drawing_data = []  # Vector drawings per page (for diagram detection)
+        if q_mime.startswith("application/pdf"):
+            try:
+                import fitz  # PyMuPDF
+                pdf_doc = fitz.open(stream=question_bytes, filetype="pdf")
+                scale = 200 / 72  # 200 DPI
+                mat = fitz.Matrix(scale, scale)
+                print(f"[PAPER EXTRACTION] Converting {len(pdf_doc)} PDF pages to PIL images...")
+                for page_num in range(len(pdf_doc)):
+                    page = pdf_doc[page_num]
+                    # Force RGB colorspace — avoids issues with CMYK/grayscale PDFs
+                    pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
+                    # Direct PIL conversion via raw samples — no intermediate PNG encode/decode
+                    pil_img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                    page_pil_images.append(pil_img)
+                    # Text blocks: (x0,y0,x1,y1,text,block_no,block_type) in PDF pts
+                    page_text_data.append({
+                        "blocks": page.get_text("blocks"),
+                        "scale": scale,
+                    })
+                    # Vector drawings (coordinate axes, shapes, dashed lines, etc.)
+                    page_drawing_data.append(page.get_drawings())
+                pdf_doc.close()
+                print(f"[PAPER EXTRACTION] Converted {len(page_pil_images)} pages")
+            except ImportError:
+                print("[PAPER EXTRACTION] PyMuPDF not installed, skipping page image conversion")
+            except Exception as img_err:
+                print(f"[PAPER EXTRACTION] PDF→PIL conversion failed: {img_err}")
+                import traceback; traceback.print_exc()
+
+        # Build the parts list for Gemini
+        parts = []
+        question_part = Part.from_data(data=question_bytes, mime_type=q_mime)
+        parts.append(question_part)
+
+        answer_part = None
+        if answerPaper:
+            answer_bytes = await answerPaper.read()
+            a_mime = answerPaper.content_type or "application/pdf"
+            answer_part = Part.from_data(data=answer_bytes, mime_type=a_mime)
+            parts.append(answer_part)
+
+        # Build context string
+        context = ""
+        if subject:
+            context += f"Subject: {subject}\n"
+        if lesson:
+            context += f"Lesson/Topic: {lesson}\n"
+
+        # Build the extraction prompt
+        type_instruction = ""
+        if paperType == "MCQ":
+            type_instruction = "All questions in this paper are Multiple Choice Questions (MCQ). Each question MUST have options."
+        elif paperType == "ESSAY":
+            type_instruction = "All questions in this paper are Essay/Short Answer type. Do NOT create options for any question."
+        else:
+            type_instruction = "This paper may contain a mix of MCQ and Essay questions. Identify the type of each question based on whether it has options/choices listed."
+
+        answer_instruction = ""
+        if answerPaper:
+            answer_instruction = """
+A second document (answer paper) is also provided. Match each answer to its corresponding question by question number.
+For MCQ questions, mark the correct option as isCorrect: true based on the answer paper.
+For Essay questions, include the model answer text in the "modelAnswer" field."""
+        
+        prompt = f"""{context}
+{type_instruction}
+{answer_instruction}
+
+Analyze the provided question paper document(s) and extract ALL questions into a structured JSON format.
+
+IMPORTANT RULES:
+1. Extract EVERY question from the paper, do not skip any
+2. Preserve the exact question text as written in the paper
+3. For MCQ questions, extract ALL options exactly as written
+4. Identify marks for each question if shown (look for patterns like "(5 marks)", "[2]", etc.)
+5. If marks are not specified, use {defaultMarks} as the default
+6. Preserve mathematical expressions, formulas, and special notation
+7. If a question has sub-parts (a, b, c...), combine them into one question text preserving the structure
+8. Return ONLY valid JSON, no markdown code blocks, no explanation text
+
+Return the following JSON structure:
+{{
+    "paperTitle": "Title of the paper if visible, otherwise null",
+    "questions": [
+        {{
+            "questionNumber": 1,
+            "text": "The full question text including any sub-parts",
+            "type": "MCQ" or "ESSAY",
+            "marks": number or null,
+            "startPage": 1,
+            "endPage": 2,
+            "options": [
+                {{"text": "Option A text", "isCorrect": false}},
+                {{"text": "Option B text", "isCorrect": true}}
+            ] or null for essay questions,
+            "modelAnswer": "The model answer text if available, otherwise null"
+        }}
+    ]
+}}
+
+IMPORTANT:
+- "startPage" must be the 1-indexed page number in the QUESTION PAPER PDF where this question FIRST appears.
+- "endPage" must be the 1-indexed page number where this question ENDS (including the last sub-part). If the question is only on one page, endPage equals startPage."""
+
+        print("[PAPER EXTRACTION] === PROMPT ===")
+        print(prompt[:500] + "..." if len(prompt) > 500 else prompt)
+        print("=" * 60)
+
+        # Send to Gemini
+        raw_response, usage = model_loader.predict_with_parts(parts, prompt)
+
+        # Log token usage
+        token_logger.log_usage(
+            operation="extract_paper",
+            input_tokens=usage['prompt_token_count'],
+            output_tokens=usage['candidates_token_count'],
+            doc_type="paper",
+            subject=subject,
+            lesson=lesson,
+            image_included=True,
+            batch_size=1
+        )
+
+        print(f"[PAPER EXTRACTION] Raw response length: {len(raw_response)}")
+        print(f"[PAPER EXTRACTION] Raw response preview: {raw_response[:200]}...")
+
+        # Clean up the response - remove markdown code blocks if present
+        cleaned = raw_response.strip()
+        if cleaned.startswith("```json"):
+            cleaned = cleaned[7:]
+        elif cleaned.startswith("```"):
+            cleaned = cleaned[3:]
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3]
+        cleaned = cleaned.strip()
+
+        # Parse the JSON response
+        try:
+            parsed = json_module.loads(cleaned)
+        except json_module.JSONDecodeError as e:
+            print(f"[PAPER EXTRACTION] JSON parse error: {e}")
+            print(f"[PAPER EXTRACTION] Cleaned response: {cleaned[:500]}")
+            raise HTTPException(
+                status_code=500, 
+                detail=f"AI returned invalid JSON. Raw response preview: {cleaned[:200]}"
+            )
+
+        # Validate and build response
+        questions = []
+        raw_questions = parsed.get("questions", [])
+        
+        for q in raw_questions:
+            options = None
+            if q.get("options") and q.get("type", "").upper() == "MCQ":
+                options = [
+                    {"text": opt.get("text", ""), "isCorrect": bool(opt.get("isCorrect", False))}
+                    for opt in q["options"]
+                ]
+            
+            questions.append(ParsedQuestion(
+                questionNumber=q.get("questionNumber", len(questions) + 1),
+                text=q.get("text", ""),
+                type=q.get("type", "ESSAY").upper(),
+                marks=q.get("marks", defaultMarks),
+                options=options,
+                modelAnswer=q.get("modelAnswer"),
+                startPage=q.get("startPage"),
+                endPage=q.get("endPage")
+            ))
+
+        print(f"[PAPER EXTRACTION] Successfully parsed {len(questions)} questions")
+
+        # --- Helper: find where a question number starts on a page (pixel y-coordinate) ---
+        def find_question_y_on_page(page_idx: int, question_num: int) -> Optional[int]:
+            """
+            Search the page's text blocks for the first occurrence of `question_num`
+            at the start of a text block (e.g. "3.", "(3)", "Q3 ").
+            Returns pixel y-coordinate (top of that block) or None if not found.
+            """
+            import re
+            if page_idx >= len(page_text_data):
+                return None
+            info = page_text_data[page_idx]
+            scale = info["scale"]
+            patterns = [
+                rf'^\s*{question_num}[\.\)\s]',          # "3." / "3)" / "3 "
+                rf'^\s*\({question_num}\)',                # "(3)"
+                rf'^\s*[Qq]\.?\s*{question_num}[\.\)\s]', # "Q3." / "Q. 3 "
+            ]
+            for block in info["blocks"]:
+                if len(block) < 7:
+                    continue
+                x0, y0, x1, y1, text, _bno, btype = block
+                if btype != 0:          # skip image/drawing blocks
+                    continue
+                first_line = text.strip().split('\n')[0].strip()
+                for pat in patterns:
+                    if re.match(pat, first_line, re.IGNORECASE):
+                        return int(y0 * scale)
+            return None
+
+        # --- Compact a page strip to only its content rows ---
+        def compact_to_text_blocks(
+            img: Image.Image,
+            page_idx: int,
+            crop_top_page_px: int,
+            crop_bottom_page_px: int,
+            excl_top_page_px: int = 0,
+            excl_bot_page_px: int = 0,
+        ) -> Image.Image:
+            """
+            Remove answer spaces from a question image using PyMuPDF's structural data.
+
+            Three content sources:
+              1. Text blocks  — question text, marks, sub-question labels
+              2. Raster image blocks — embedded photos / scanned diagrams
+              3. Solid vector drawings — coordinate axes, geometric shapes, curves
+
+            Two answer-space sources that are explicitly excluded:
+              A. Text blocks whose content is only repeated dots/dashes
+                 (Cambridge prints answer lines as '......' text characters)
+              B. Vector drawings that are dashed AND wide (> 65 % of page width)
+                 (Cambridge also uses dashed PDF paths for some answer lines)
+            """
+            import re
+            if not page_text_data or page_idx >= len(page_text_data):
+                return img
+
+            info = page_text_data[page_idx]
+            scale = info["scale"]
+            full_page_h  = page_pil_images[page_idx].height
+            page_width_px = page_pil_images[page_idx].width
+
+            CONTENT_PAD = 10
+            MERGE_GAP   = 45   # merge bands within this px distance
+            STRIP_GAP   = 14   # whitespace inserted between output strips
+
+            # Characters that mark a text block as an answer-line placeholder
+            ANSWER_LINE_CHARS = frozenset(
+                '.−_·•–—…⋯―\u2026\u22ef\u00b7\u2015\u2010\u2012\u2013\u2014'
+            )
+
+            bands: list = []
+
+            # ── 1. Text and raster-image blocks ─────────────────────────────────
+            for block in info["blocks"]:
+                if len(block) < 7:
+                    continue
+                x0, y0, x1, y1, text, _bno, btype = block
+
+                if btype == 0:          # text block
+                    if not text.strip():
+                        continue
+                    # Detect answer-line text: only repeated dot/dash characters
+                    cleaned = re.sub(r'\s', '', text)
+                    if len(cleaned) >= 10 and all(c in ANSWER_LINE_CHARS for c in cleaned):
+                        continue        # all answer-line chars → skip
+
+                elif btype == 1:        # embedded raster image (diagram, graph)
+                    if (x1 - x0) * scale < 40 or (y1 - y0) * scale < 20:
+                        continue        # too small to matter
+                else:
+                    continue
+
+                pp0 = int(y0 * scale)
+                pp1 = int(y1 * scale)
+
+                if excl_top_page_px and pp0 < excl_top_page_px:
+                    continue
+                if excl_bot_page_px and pp1 > full_page_h - excl_bot_page_px:
+                    continue
+                if pp1 < crop_top_page_px or pp0 > crop_bottom_page_px:
+                    continue
+
+                rel0 = max(0, pp0 - crop_top_page_px - CONTENT_PAD)
+                rel1 = min(img.height, pp1 - crop_top_page_px + CONTENT_PAD)
+                if rel1 > rel0:
+                    bands.append((rel0, rel1))
+
+            # ── 2. Vector drawings (coordinate axes, shapes, diagram lines) ─────
+            # Include solid drawings.  Skip dashed drawings that span most of the
+            # page width — those are answer lines in vector form.
+            # Narrow dashed lines (< 65 % page width) are kept — they're diagram
+            # details like dimension indicators (e.g. the "h" line in mechanics).
+            if page_drawing_data and page_idx < len(page_drawing_data):
+                for drawing in page_drawing_data[page_idx]:
+                    rect = drawing.get("rect")
+                    if not rect:
+                        continue
+                    dx0, dy0, dx1, dy1 = rect
+                    pp0  = int(dy0 * scale)
+                    pp1  = int(dy1 * scale)
+                    w_px = int((dx1 - dx0) * scale)
+                    h_px = pp1 - pp0
+
+                    if h_px < 15 or w_px < 15:
+                        continue        # too small
+
+                    dashes = drawing.get("dashes") or ""
+                    is_dashed = dashes and dashes not in ("", "[] 0")
+                    is_wide   = w_px > page_width_px * 0.65
+
+                    if is_dashed and is_wide:
+                        continue        # wide dashed drawing = answer line
+
+                    if h_px < 6:
+                        continue        # flat horizontal stroke = answer line element
+
+                    if excl_top_page_px and pp0 < excl_top_page_px:
+                        continue
+                    if excl_bot_page_px and pp1 > full_page_h - excl_bot_page_px:
+                        continue
+                    if pp1 < crop_top_page_px or pp0 > crop_bottom_page_px:
+                        continue
+
+                    rel0 = max(0, pp0 - crop_top_page_px - CONTENT_PAD)
+                    rel1 = min(img.height, pp1 - crop_top_page_px + CONTENT_PAD)
+                    if rel1 > rel0:
+                        bands.append((rel0, rel1))
+
+            # ── 3. Merge bands and build compacted output ────────────────────────
+            if not bands:
+                print(f"      [compact] no content found — returning unchanged")
+                return img
+
+            bands.sort()
+            merged = [list(bands[0])]
+            for s, e in bands[1:]:
+                if s - merged[-1][1] <= MERGE_GAP:
+                    merged[-1][1] = max(merged[-1][1], e)
+                else:
+                    merged.append([s, e])
+
+            total_content = sum(e - s for s, e in merged)
+            new_h = total_content + STRIP_GAP * max(0, len(merged) - 1)
+
+            if new_h >= img.height * 0.85:
+                print(f"      [compact] only {100 - int(new_h/img.height*100)}% removable "
+                      f"— returning unchanged")
+                return img
+
+            result = Image.new("RGB", (img.width, new_h), (255, 255, 255))
+            y_out = 0
+            for i, (s, e) in enumerate(merged):
+                result.paste(img.crop((0, s, img.width, e)), (0, y_out))
+                y_out += e - s
+                if i < len(merged) - 1:
+                    y_out += STRIP_GAP
+
+            removed_pct = 100 - int(new_h / img.height * 100)
+            print(f"      [compact] {img.height}px → {new_h}px "
+                  f"({len(merged)} strips, {removed_pct}% removed)")
+            return result
+
+        # --- Generate per-question cropped + compacted images ---
+        # Page header / footer exclusion (Cambridge papers: ~40px header, ~80px footer at 200 DPI)
+        HDR_EXCL_PX = 45   # skip text blocks in top 45 px of any page (page numbers)
+        FTR_EXCL_PX = 85   # skip text blocks in bottom 85 px of any page (© + barcode)
+
+        question_images_b64: List[Optional[str]] = []
+        if page_pil_images:
+            print(f"[PAPER EXTRACTION] Generating question images for {len(questions)} questions...")
+            for qi, q in enumerate(questions):
+                sp = (q.startPage or 1) - 1   # 0-indexed start page
+                ep = (q.endPage or q.startPage or 1) - 1   # 0-indexed end page
+                sp = max(0, min(sp, len(page_pil_images) - 1))
+                ep = max(sp, min(ep, len(page_pil_images) - 1))
+
+                next_q = questions[qi + 1] if qi + 1 < len(questions) else None
+                next_q_num = next_q.questionNumber if next_q else None
+
+                try:
+                    compacted_strips = []
+                    for pi in range(sp, ep + 1):
+                        page_img = page_pil_images[pi]
+                        crop_top    = 0
+                        crop_bottom = page_img.height
+
+                        if pi == sp:
+                            y_start = find_question_y_on_page(pi, q.questionNumber)
+                            if y_start is not None:
+                                crop_top = max(0, y_start - 15)
+
+                        if pi == ep and next_q_num:
+                            next_sp = (next_q.startPage or 1) - 1 if next_q else None
+                            if next_sp == ep:
+                                y_end = find_question_y_on_page(pi, next_q_num)
+                                if y_end is not None:
+                                    crop_bottom = min(y_end + 5, page_img.height)
+
+                        raw_strip = page_img.crop((0, crop_top, page_img.width, crop_bottom))
+
+                        # Header exclusion only on pages that are NOT the start page
+                        # (the start page's crop already begins below the header).
+                        # Footer exclusion on every page so Cambridge © line is removed.
+                        hdr = HDR_EXCL_PX if pi != sp else 0
+
+                        compacted = compact_to_text_blocks(
+                            raw_strip, pi,
+                            crop_top_page_px=crop_top,
+                            crop_bottom_page_px=crop_bottom,
+                            excl_top_page_px=hdr,
+                            excl_bot_page_px=FTR_EXCL_PX,
+                        )
+                        compacted_strips.append(compacted)
+
+                    # Stitch compacted strips vertically
+                    if len(compacted_strips) == 1:
+                        final_img = compacted_strips[0]
+                    else:
+                        max_w   = max(s.width  for s in compacted_strips)
+                        total_h = sum(s.height for s in compacted_strips)
+                        final_img = Image.new("RGB", (max_w, total_h), (255, 255, 255))
+                        y_off = 0
+                        for s in compacted_strips:
+                            final_img.paste(s, (0, y_off))
+                            y_off += s.height
+
+                    buf = io.BytesIO()
+                    final_img.save(buf, format="PNG", optimize=True)
+                    question_images_b64.append(base64.b64encode(buf.getvalue()).decode("utf-8"))
+                    print(f"  Q{q.questionNumber}: pages {sp+1}-{ep+1} → "
+                          f"final {final_img.width}x{final_img.height}px")
+
+                except Exception as q_err:
+                    print(f"  Q{q.questionNumber}: failed ({q_err}), fallback to full page")
+                    import traceback; traceback.print_exc()
+                    try:
+                        buf = io.BytesIO()
+                        page_pil_images[sp].save(buf, format="PNG", optimize=True)
+                        question_images_b64.append(base64.b64encode(buf.getvalue()).decode("utf-8"))
+                    except Exception:
+                        question_images_b64.append(None)
+
+            print(f"[PAPER EXTRACTION] Generated {len(question_images_b64)} question images")
+
+        return PaperExtractionResponse(
+            questions=questions,
+            totalQuestions=len(questions),
+            paperTitle=parsed.get("paperTitle"),
+            questionImages=question_images_b64 if question_images_b64 else None
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[PAPER EXTRACTION] Error: {e}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 
