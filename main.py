@@ -341,8 +341,11 @@ async def extract_paper(
                     pil_img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                     page_pil_images.append(pil_img)
                     # Text blocks: (x0,y0,x1,y1,text,block_no,block_type) in PDF pts
+                    # Words: (x0,y0,x1,y1,word,block_no,line_no,word_no) in PDF pts
                     page_text_data.append({
                         "blocks": page.get_text("blocks"),
+                        "words": page.get_text("words"),
+                        "page_width": page.rect.width,  # PDF pts, used for left-margin ratio
                         "scale": scale,
                     })
                     # Vector drawings (coordinate axes, shapes, dashed lines, etc.)
@@ -462,16 +465,76 @@ IMPORTANT:
             cleaned = cleaned[:-3]
         cleaned = cleaned.strip()
 
-        # Parse the JSON response
+        def fix_latex_json_escapes(text: str) -> str:
+            """
+            Gemini returns LaTeX math inside JSON strings, e.g.
+              "text": "... $I_n = \\int_0^1 x^n dx$ ..."
+            LaTeX backslash commands like \\int, \\frac, \\alpha are not valid
+            JSON escape sequences and cause json.loads() to raise JSONDecodeError.
+
+            This function walks the string character-by-character and doubles any
+            backslash that is not part of a valid JSON escape sequence, so that
+            json.loads() parses them as literal backslash + letter (which is the
+            correct representation of LaTeX commands in JSON strings).
+
+            Valid JSON escapes preserved as-is: \\" \\/ \\\\ \\n \\r \\t \\uXXXX
+            Everything else (\\i, \\f, \\a, \\b, \\s, \\p, …) is doubled.
+            Note: \\f (form-feed) and \\b (backspace) are intentionally treated as
+            LaTeX because Gemini never emits them as control characters — they are
+            always LaTeX commands like \\frac or \\begin.
+            """
+            result: list = []
+            i = 0
+            n = len(text)
+            while i < n:
+                ch = text[i]
+                if ch != '\\':
+                    result.append(ch)
+                    i += 1
+                    continue
+                # We have a backslash — peek at the next character
+                if i + 1 >= n:
+                    result.append('\\\\')   # trailing backslash → escape it
+                    i += 1
+                    continue
+                nxt = text[i + 1]
+                if nxt in ('"', '\\', '/', 'n', 'r', 't'):
+                    # Intentional JSON escape — keep exactly as-is
+                    result.append(ch)
+                    result.append(nxt)
+                    i += 2
+                elif nxt == 'u' and i + 5 <= n:
+                    hex4 = text[i + 2: i + 6]
+                    if len(hex4) == 4 and all(c in '0123456789abcdefABCDEF' for c in hex4):
+                        # Valid \uXXXX unicode escape
+                        result.append(text[i: i + 6])
+                        i += 6
+                    else:
+                        # \u not followed by 4 hex digits — LaTeX \upsilon etc.
+                        result.append('\\\\')
+                        i += 1
+                else:
+                    # Invalid JSON escape (LaTeX command: \int, \frac, \alpha …)
+                    result.append('\\\\')
+                    i += 1
+            return ''.join(result)
+
+        # Parse the JSON response — with automatic LaTeX escape repair on failure
         try:
             parsed = json_module.loads(cleaned)
         except json_module.JSONDecodeError as e:
-            print(f"[PAPER EXTRACTION] JSON parse error: {e}")
-            print(f"[PAPER EXTRACTION] Cleaned response: {cleaned[:500]}")
-            raise HTTPException(
-                status_code=500, 
-                detail=f"AI returned invalid JSON. Raw response preview: {cleaned[:200]}"
-            )
+            print(f"[PAPER EXTRACTION] JSON parse error: {e} — attempting LaTeX escape fix")
+            fixed = fix_latex_json_escapes(cleaned)
+            try:
+                parsed = json_module.loads(fixed)
+                print("[PAPER EXTRACTION] JSON parsed successfully after LaTeX escape fix")
+            except json_module.JSONDecodeError as e2:
+                print(f"[PAPER EXTRACTION] JSON still invalid after fix: {e2}")
+                print(f"[PAPER EXTRACTION] Cleaned response: {cleaned[:500]}")
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"AI returned invalid JSON. Raw response preview: {cleaned[:200]}"
+                )
 
         # Validate and build response
         questions = []
@@ -499,33 +562,93 @@ IMPORTANT:
         print(f"[PAPER EXTRACTION] Successfully parsed {len(questions)} questions")
 
         # --- Helper: find where a question number starts on a page (pixel y-coordinate) ---
-        def find_question_y_on_page(page_idx: int, question_num: int) -> Optional[int]:
+        def find_question_y_on_page(page_idx: int, question_num: int,
+                                    min_y_px: int = 0) -> Optional[int]:
             """
-            Search the page's text blocks for the first occurrence of `question_num`
-            at the start of a text block (e.g. "3.", "(3)", "Q3 ").
-            Returns pixel y-coordinate (top of that block) or None if not found.
+            Find the y-coordinate (pixels) where question_num begins on the page.
+
+            Strategy: use word-level extraction and restrict to the LEFT MARGIN
+            (leftmost 13% of page width). Cambridge exam papers always put question
+            numbers as isolated words in the left margin.
+
+            min_y_px  — ignore any match whose pixel-y is below this threshold.
+                        Used to skip page-header content (page numbers, running
+                        titles) when searching for a question's own start position.
+
+            Accepted forms: "28", "28.", "28)" — bare number + optional punctuation.
+            Falls back to block-level scanning if word data is unavailable.
+            Returns pixel y-coordinate of the earliest match, or None.
             """
             import re
             if page_idx >= len(page_text_data):
                 return None
             info = page_text_data[page_idx]
-            scale = info["scale"]
-            patterns = [
-                rf'^\s*{question_num}[\.\)\s]',          # "3." / "3)" / "3 "
-                rf'^\s*\({question_num}\)',                # "(3)"
-                rf'^\s*[Qq]\.?\s*{question_num}[\.\)\s]', # "Q3." / "Q. 3 "
-            ]
-            for block in info["blocks"]:
-                if len(block) < 7:
-                    continue
-                x0, y0, x1, y1, text, _bno, btype = block
-                if btype != 0:          # skip image/drawing blocks
-                    continue
-                first_line = text.strip().split('\n')[0].strip()
-                for pat in patterns:
-                    if re.match(pat, first_line, re.IGNORECASE):
-                        return int(y0 * scale)
-            return None
+            scale      = info["scale"]
+            page_width = info.get("page_width", 595)   # PDF pts, default A4
+            words      = info.get("words")
+
+            # Accept the number optionally followed by one punctuation char
+            word_re = re.compile(rf'^{question_num}[\.\)\:]?$')
+
+            # Left-margin threshold: leftmost 13% of page width.
+            # Cambridge question numbers sit at ~9–12% from the left edge;
+            # option labels / inline values begin at ~13–17%.
+            LEFT_MARGIN_MAX = page_width * 0.13
+
+            best_y: Optional[int] = None
+
+            # ── Primary: word-level search with left-margin + min-y filter ───
+            if words:
+                for word_tuple in words:
+                    if len(word_tuple) < 5:
+                        continue
+                    wx0, wy0, wx1, wy1, word_text = word_tuple[:5]
+                    # Must be in the left margin
+                    if wx0 > LEFT_MARGIN_MAX:
+                        continue
+                    y_px = int(wy0 * scale)
+                    # Skip header zone (page numbers, running titles, etc.)
+                    if y_px < min_y_px:
+                        continue
+                    if word_re.match(word_text.strip()):
+                        if best_y is None or y_px < best_y:
+                            best_y = y_px
+
+            # ── Fallback: block-level scan (no word data) ─────────────────────
+            if best_y is None:
+                inline_pats = [
+                    re.compile(rf'^\s*{question_num}[\.\)\s]'),
+                    re.compile(rf'^\s*\({question_num}\)'),
+                    re.compile(rf'^\s*{question_num}$'),
+                ]
+                margin_pat = re.compile(rf'^\s*{question_num}[\.\):]?\s*$')
+                for block in info["blocks"]:
+                    if len(block) < 7:
+                        continue
+                    x0, y0, x1, y1, text, _bno, btype = block
+                    if btype != 0:
+                        continue
+                    stripped = text.strip()
+                    if margin_pat.match(stripped):
+                        y_px = int(y0 * scale)
+                        if best_y is None or y_px < best_y:
+                            best_y = y_px
+                        continue
+                    for line_idx, line in enumerate(stripped.split('\n')[:5]):
+                        for pat in inline_pats:
+                            if pat.match(line.strip()):
+                                block_h = y1 - y0
+                                line_y  = y0 + block_h * (line_idx / max(len(stripped.split('\n')), 1))
+                                y_px    = int(line_y * scale)
+                                if best_y is None or y_px < best_y:
+                                    best_y = y_px
+                                break
+
+            if best_y is not None:
+                print(f"    [find_q_y] Q{question_num} on page {page_idx+1}: y={best_y}px")
+            else:
+                print(f"    [find_q_y] Q{question_num} on page {page_idx+1}: NOT FOUND")
+            return best_y
 
         # --- Compact a page strip to only its content rows ---
         def compact_to_text_blocks(
@@ -681,9 +804,15 @@ IMPORTANT:
             return result
 
         # --- Generate per-question cropped + compacted images ---
-        # Page header / footer exclusion (Cambridge papers: ~40px header, ~80px footer at 200 DPI)
-        HDR_EXCL_PX = 45   # skip text blocks in top 45 px of any page (page numbers)
-        FTR_EXCL_PX = 85   # skip text blocks in bottom 85 px of any page (© + barcode)
+        # Cambridge papers at 200 DPI:
+        #   Header (page number + any running title) occupies roughly the top 160 px.
+        #   Footer (© line + barcode) occupies roughly the bottom 85 px.
+        HDR_EXCL_PX = 160  # raised from 45 — must clear the printed page number
+        FTR_EXCL_PX = 85
+
+        # Track the crop_bottom used for each (question_index, page_index) so that
+        # the NEXT question can fall back to it when its own start cannot be found.
+        prev_crop_bottom: dict = {}   # key: page_idx → last known crop_bottom on that page
 
         question_images_b64: List[Optional[str]] = []
         if page_pil_images:
@@ -705,18 +834,43 @@ IMPORTANT:
                         crop_bottom = page_img.height
 
                         if pi == sp:
-                            y_start = find_question_y_on_page(pi, q.questionNumber)
+                            # Pass HDR_EXCL_PX as min_y_px so page-number words
+                            # at the top of the page are never mistaken for Q1/Q2/Q3
+                            y_start = find_question_y_on_page(
+                                pi, q.questionNumber, min_y_px=HDR_EXCL_PX)
                             if y_start is not None:
                                 crop_top = max(0, y_start - 15)
+                                print(f"  Q{q.questionNumber}: start found at y={y_start}px on page {pi+1}")
+                            else:
+                                # Fallback: use the previous question's crop_bottom on
+                                # this same page as our crop_top.  This handles the
+                                # common case where the question number is not found
+                                # (e.g. Q3 on a page that also prints "3" as page-number
+                                # in a different position) but we know where Q2 ended.
+                                fallback = prev_crop_bottom.get(pi)
+                                if fallback is not None:
+                                    crop_top = fallback
+                                    print(f"  Q{q.questionNumber}: start NOT found — "
+                                          f"using prev boundary y={crop_top}px on page {pi+1}")
+                                else:
+                                    print(f"  Q{q.questionNumber}: start NOT found, no fallback")
 
                         if pi == ep and next_q_num:
-                            next_sp = (next_q.startPage or 1) - 1 if next_q else None
-                            if next_sp == ep:
-                                y_end = find_question_y_on_page(pi, next_q_num)
-                                if y_end is not None:
-                                    crop_bottom = min(y_end + 5, page_img.height)
+                            # Always search for the next question on this page as a boundary.
+                            y_end = find_question_y_on_page(pi, next_q_num, min_y_px=HDR_EXCL_PX)
+                            if y_end is not None and y_end > crop_top + 80:
+                                crop_bottom = min(y_end + 5, page_img.height)
+                                print(f"  Q{q.questionNumber}: bottom boundary Q{next_q_num} at y={y_end}px")
+                                print(f"  Q{q.questionNumber}: found Q{next_q_num} boundary at y={y_end}px on page {pi+1}")
+                            elif y_end is not None:
+                                print(f"  Q{q.questionNumber}: ignored suspicious Q{next_q_num} boundary at y={y_end}px "
+                                      f"(only {y_end - crop_top}px below crop_top={crop_top}px — likely false positive)")
 
                         raw_strip = page_img.crop((0, crop_top, page_img.width, crop_bottom))
+
+                        # Record crop_bottom for this page so the next question can
+                        # use it as a fallback crop_top if its own start is not found.
+                        prev_crop_bottom[pi] = crop_bottom
 
                         # Header exclusion only on pages that are NOT the start page
                         # (the start page's crop already begins below the header).
