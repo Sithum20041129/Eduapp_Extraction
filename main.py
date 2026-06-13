@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Request
 from pydantic import BaseModel
 from typing import Optional, List
 import uvicorn
@@ -83,6 +83,20 @@ Output mathematical formulas in LaTeX format. Do not add any conversational text
 
 app = FastAPI(title="EduApp AI Service")
 
+# ── Rate limiting (slowapi) ───────────────────────────────────────────────
+# Caps request volume on the expensive AI endpoints so an attacker (or a
+# runaway loop) cannot exhaust GCP quota / run up unbounded Vertex AI bills.
+from rate_limiter import (
+    limiter,
+    _rate_limit_exceeded_handler,
+    RateLimitExceeded,
+    EXTRACT_RATE_LIMIT,
+    BATCH_RATE_LIMIT,
+    PAPER_RATE_LIMIT,
+)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
 # Initialize model loader
 model_loader = ModelLoader.get_instance()
 
@@ -114,8 +128,10 @@ async def health_check():
     return {"status": "healthy", "service": "EduApp AI Service"}
 
 @app.post("/extract", response_model=ExtractionResponse)
+@limiter.limit(EXTRACT_RATE_LIMIT)
 async def extract_text(
-    file: UploadFile = File(...), 
+    request: Request,
+    file: UploadFile = File(...),
     subject: Optional[str] = Form(default=None),
     lesson: Optional[str] = Form(default=None),
     docType: Optional[str] = Form(default="question")
@@ -159,7 +175,9 @@ async def extract_text(
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/extract-batch", response_model=BatchExtractionResponse)
+@limiter.limit(BATCH_RATE_LIMIT)
 async def extract_text_batch(
+    request: Request,
     files: List[UploadFile] = File(...),
     ids: str = Form(...),  # Comma-separated IDs matching each file
     contexts: Optional[str] = Form(None),  # JSON mapping id -> {subject, lesson, docType}
@@ -287,7 +305,9 @@ class PaperExtractionResponse(BaseModel):
 
 
 @app.post("/extract-paper", response_model=PaperExtractionResponse)
+@limiter.limit(PAPER_RATE_LIMIT)
 async def extract_paper(
+    request: Request,
     questionPaper: UploadFile = File(...),
     answerPaper: Optional[UploadFile] = File(None),
     subject: Optional[str] = Form(None),
