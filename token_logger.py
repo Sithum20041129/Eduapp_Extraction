@@ -1,16 +1,25 @@
 import csv
-import os
+import logging
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+import config
+
+logger = logging.getLogger("ai_service.token_logger")
 
 # Gemini 1.5 Flash Pricing (per 1M tokens)
 INPUT_COST_PER_MILLION = 0.075  # $0.075 per 1M input tokens
 OUTPUT_COST_PER_MILLION = 0.30   # $0.30 per 1M output tokens
 
-# Log directory
-LOG_DIR = Path(__file__).parent / "logs"
-LOG_DIR.mkdir(exist_ok=True)
+# Log directory — configurable (TOKEN_LOG_DIR) so it can live outside the
+# web-served app root; defaults to ./logs beside this module.
+LOG_DIR = Path(config.TOKEN_LOG_DIR) if config.TOKEN_LOG_DIR else (Path(__file__).parent / "logs")
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+# Serialises CSV writes so concurrent requests cannot interleave/​truncate rows.
+_WRITE_LOCK = threading.Lock()
 
 class TokenLogger:
     """Utility class for logging token usage and calculating costs"""
@@ -29,23 +38,26 @@ class TokenLogger:
         """Create log file with headers if it doesn't exist"""
         if not self.log_file.exists():
             try:
-                with open(self.log_file, 'w', newline='') as f:
-                    writer = csv.writer(f)
-                    writer.writerow([
-                        'timestamp',
-                        'operation',
-                        'doc_type',
-                        'subject',
-                        'lesson',
-                        'input_tokens',
-                        'output_tokens',
-                        'total_tokens',
-                        'estimated_cost_usd',
-                        'image_included',
-                        'batch_size'
-                    ])
+                with _WRITE_LOCK:
+                    if self.log_file.exists():
+                        return
+                    with open(self.log_file, 'w', newline='') as f:
+                        writer = csv.writer(f)
+                        writer.writerow([
+                            'timestamp',
+                            'operation',
+                            'doc_type',
+                            'subject',
+                            'lesson',
+                            'input_tokens',
+                            'output_tokens',
+                            'total_tokens',
+                            'estimated_cost_usd',
+                            'image_included',
+                            'batch_size'
+                        ])
             except Exception as e:
-                 print(f"[TOKEN LOGGER ERROR] Failed to initialize log file: {e}")
+                logger.error("Failed to initialize token usage log: %s", e)
     
     @staticmethod
     def calculate_cost(input_tokens: int, output_tokens: int) -> float:
@@ -88,26 +100,30 @@ class TokenLogger:
             self._ensure_log_file_exists()
         
         try:
-            with open(self.log_file, 'a', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow([
-                    datetime.now().isoformat(),
-                    operation,
-                    doc_type,
-                    subject or '',
-                    lesson or '',
-                    input_tokens,
-                    output_tokens,
-                    total_tokens,
-                    f"{cost:.6f}",
-                    image_included,
-                    batch_size
-                ])
+            # Lock so concurrent requests cannot interleave or truncate rows.
+            with _WRITE_LOCK:
+                with open(self.log_file, 'a', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow([
+                        datetime.now().isoformat(),
+                        operation,
+                        doc_type,
+                        subject or '',
+                        lesson or '',
+                        input_tokens,
+                        output_tokens,
+                        total_tokens,
+                        f"{cost:.6f}",
+                        image_included,
+                        batch_size
+                    ])
         except Exception as e:
-            print(f"[TOKEN LOGGER ERROR] Failed to write to log file: {e}")
-        
-        # Also log summary to console
-        print(f"[TOKEN USAGE] {operation} | Tokens: {total_tokens} (in: {input_tokens}, out: {output_tokens}) | Cost: ${cost:.6f}")
+            logger.error("Failed to write to token usage log: %s", e)
+
+        logger.info(
+            "token usage | %s | total=%d (in=%d out=%d) | $%.6f",
+            operation, total_tokens, input_tokens, output_tokens, cost,
+        )
     
     def get_summary(self, days: int = 30) -> dict:
         """Get summary statistics for the last N days"""

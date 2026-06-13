@@ -1,56 +1,91 @@
+import io
+import logging
+import threading
+
 import vertexai
 from vertexai.generative_models import GenerativeModel, Part, Image as VertexImage
 from PIL import Image
-import os
-import io
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_random_exponential,
+)
 
-from dotenv import load_dotenv
+import config
 
-load_dotenv()
+logger = logging.getLogger("ai_service.model_loader")
+
+# Retry only on transient upstream errors (429/503/timeouts), not on bugs.
+try:
+    from google.api_core import exceptions as _gexc
+    _RETRYABLE = (
+        _gexc.ResourceExhausted,
+        _gexc.ServiceUnavailable,
+        _gexc.DeadlineExceeded,
+        _gexc.InternalServerError,
+        _gexc.TooManyRequests,
+    )
+except Exception:  # pragma: no cover - google libs always present at runtime
+    _RETRYABLE = (Exception,)
+
+
+@retry(
+    reraise=True,
+    stop=stop_after_attempt(config.MODEL_MAX_RETRIES),
+    wait=wait_random_exponential(multiplier=1, max=20),
+    retry=retry_if_exception_type(_RETRYABLE),
+)
+def _generate_with_retry(model, inputs):
+    """Call generate_content with exponential backoff on transient errors."""
+    return model.generate_content(inputs)
+
 
 class ModelLoader:
     _instance = None
-    _model = None
-    _project_id = os.getenv("GCP_PROJECT_ID")
-    _location = os.getenv("GCP_LOCATION", "asia-south1")
-    _credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    _instance_lock = threading.Lock()
+
+    def __init__(self):
+        self._model = None
+        self._model_lock = threading.Lock()
 
     @classmethod
     def get_instance(cls):
+        # Double-checked locking so concurrent first-requests don't each
+        # construct an instance / re-initialise Vertex AI.
         if cls._instance is None:
-            cls._instance = ModelLoader()
+            with cls._instance_lock:
+                if cls._instance is None:
+                    cls._instance = ModelLoader()
         return cls._instance
 
     def load_model(self):
-        if self._model is None:
-            print("Configuring Vertex AI...")
+        if self._model is not None:
+            return
+        with self._model_lock:
+            if self._model is not None:  # another thread won the race
+                return
+            logger.info("Configuring Vertex AI...")
             try:
-                if not self._project_id:
+                if not config.GCP_PROJECT_ID:
                     raise ValueError("GCP_PROJECT_ID environment variable is not set")
-                
-                # Initialize Vertex AI with project and location
-                vertexai.init(
-                    project=self._project_id,
-                    location=self._location
-                )
 
-                # Using the specific model requested.
-                model_name = "gemini-2.5-flash" 
-
+                vertexai.init(project=config.GCP_PROJECT_ID, location=config.GCP_LOCATION)
+                model_name = config.PRIMARY_MODEL
                 self._model = GenerativeModel(model_name)
-                print(f"Vertex AI model '{model_name}' configured successfully.")
-                print(f"  Project: {self._project_id}")
-                print(f"  Location: {self._location}")
+                logger.info(
+                    "Vertex AI model '%s' configured (project=%s location=%s)",
+                    model_name, config.GCP_PROJECT_ID, config.GCP_LOCATION,
+                )
             except Exception as e:
-                print(f"Error configuring Vertex AI: {e}")
-                # Fallback purely for robustness
-                print("Attempting fallback to 'gemini-1.5-flash'...")
+                logger.error("Error configuring Vertex AI: %s", e)
+                logger.info("Attempting fallback to '%s'...", config.FALLBACK_MODEL)
                 try:
-                    self._model = GenerativeModel("gemini-1.5-flash")
-                    print("Fallback to gemini-1.5-flash successful.")
+                    self._model = GenerativeModel(config.FALLBACK_MODEL)
+                    logger.info("Fallback to %s successful.", config.FALLBACK_MODEL)
                 except Exception as ex:
-                    print(f"Fallback failed: {ex}")
-                    raise ex
+                    logger.error("Fallback failed: %s", ex)
+                    raise
 
     def get_model(self):
         if self._model is None:
@@ -79,8 +114,8 @@ class ModelLoader:
                 image_included = True
         
         try:
-            response = model.generate_content(inputs)
-            
+            response = _generate_with_retry(model, inputs)
+
             # Extract usage metadata from response
             usage_metadata = {
                 'prompt_token_count': getattr(response.usage_metadata, 'prompt_token_count', 0),
@@ -88,10 +123,11 @@ class ModelLoader:
                 'total_token_count': getattr(response.usage_metadata, 'total_token_count', 0),
                 'image_included': image_included
             }
-            
+
             return response.text, usage_metadata
         except Exception as e:
-            # Handle potential API errors
+            # Handle potential API errors (after retries are exhausted)
+            logger.error("generate_content failed after retries: %s", e)
             error_metadata = {
                 'prompt_token_count': 0,
                 'candidates_token_count': 0,
@@ -113,9 +149,9 @@ class ModelLoader:
         """
         model = self.get_model()
         inputs = [prompt_text] + parts
-        
+
         try:
-            response = model.generate_content(inputs)
+            response = _generate_with_retry(model, inputs)
             usage_metadata = {
                 'prompt_token_count': getattr(response.usage_metadata, 'prompt_token_count', 0),
                 'candidates_token_count': getattr(response.usage_metadata, 'candidates_token_count', 0),
@@ -133,6 +169,7 @@ class ModelLoader:
                         text += part.text
             return text, usage_metadata
         except Exception as e:
+            logger.error("generate_content (parts) failed after retries: %s", e)
             error_metadata = {
                 'prompt_token_count': 0,
                 'candidates_token_count': 0,

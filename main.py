@@ -1,6 +1,11 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Request
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Request, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
+import asyncio
+import logging
 import uvicorn
 from model_loader import ModelLoader
 from token_logger import token_logger
@@ -9,6 +14,52 @@ from PIL import Image
 import io
 import os
 import base64
+
+import config
+from auth import require_api_key
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+logger = logging.getLogger("ai_service.main")
+
+
+async def _read_upload_validated(
+    upload: UploadFile, allowed_types: set[str], label: str = "file"
+) -> bytes:
+    """
+    Read an uploaded file, enforcing a MIME allowlist and a max size.
+
+    Prevents oversized uploads (memory exhaustion / decompression bombs) and
+    rejects unexpected content types before they reach PIL / the model.
+    """
+    if upload.content_type not in allowed_types:
+        raise HTTPException(
+            status_code=415,
+            detail=f"Unsupported {label} type '{upload.content_type}'. "
+                   f"Allowed: {sorted(allowed_types)}",
+        )
+    data = await upload.read()
+    if len(data) > config.MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"{label} too large: {len(data)} bytes "
+                   f"(max {config.MAX_UPLOAD_BYTES}).",
+        )
+    if not data:
+        raise HTTPException(status_code=400, detail=f"Empty {label} uploaded.")
+    return data
+
+
+def _validate_form_field(value: Optional[str], name: str) -> Optional[str]:
+    """Reject absurdly long free-text form fields (defensive input validation)."""
+    if value is not None and len(value) > config.MAX_FORM_FIELD_LEN:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{name} exceeds {config.MAX_FORM_FIELD_LEN} characters.",
+        )
+    return value
 
 # Subject-specific extraction prompts for better accuracy
 SUBJECT_PROMPTS = {
@@ -97,6 +148,43 @@ from rate_limiter import (
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+
+# ── Security headers ──────────────────────────────────────────────────────
+# Defence-in-depth headers applied to every response.
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+        response.headers.setdefault("Content-Security-Policy", "default-src 'none'")
+        return response
+
+
+app.add_middleware(SecurityHeadersMiddleware)
+
+# ── CORS ──────────────────────────────────────────────────────────────────
+# Locked to an explicit allowlist (never "*"). Empty list => no cross-origin.
+if config.CORS_ALLOWED_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=config.CORS_ALLOWED_ORIGINS,
+        allow_methods=["GET", "POST"],
+        allow_headers=["X-API-Key", "Content-Type"],
+    )
+
+
+# ── Generic exception handler ─────────────────────────────────────────────
+# Never leak stack traces / internal paths to clients; log them server-side.
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error."},
+    )
+
+
 # Initialize model loader
 model_loader = ModelLoader.get_instance()
 
@@ -127,7 +215,7 @@ async def startup_event():
 async def health_check():
     return {"status": "healthy", "service": "EduApp AI Service"}
 
-@app.post("/extract", response_model=ExtractionResponse)
+@app.post("/extract", response_model=ExtractionResponse, dependencies=[Depends(require_api_key)])
 @limiter.limit(EXTRACT_RATE_LIMIT)
 async def extract_text(
     request: Request,
@@ -137,27 +225,20 @@ async def extract_text(
     docType: Optional[str] = Form(default="question")
 ):
     try:
-        # DEBUG: Log received parameters with VISIBLE formatting
-        print("=" * 60)
-        print("[EXTRACTION DEBUG] === RECEIVED PARAMS ===")
-        print(f"  subject: '{subject}' (type: {type(subject).__name__})")
-        print(f"  lesson:  '{lesson}' (type: {type(lesson).__name__})")
-        print(f"  docType: '{docType}' (type: {type(docType).__name__})")
-        print("=" * 60)
-        
-        contents = await file.read()
+        subject = _validate_form_field(subject, "subject")
+        lesson = _validate_form_field(lesson, "lesson")
+        logger.info("extract request: subject=%s lesson=%s docType=%s", subject, lesson, docType)
+
+        contents = await _read_upload_validated(file, config.ALLOWED_IMAGE_TYPES, "image")
         image = Image.open(io.BytesIO(contents))
-        
+
         # Use context-primed prompt for better extraction
         prompt = get_extraction_prompt(subject, lesson, docType if docType else "question")
-        
-        # DEBUG: Log the FULL generated prompt
-        print("[EXTRACTION DEBUG] === FULL PROMPT ===")
-        print(prompt)
-        print("=" * 60)
-        
-        extracted, usage = model_loader.predict(image, prompt)
-        
+
+        # Run the blocking Vertex AI call off the event loop so concurrent
+        # requests are not starved while one inference is in flight.
+        extracted, usage = await asyncio.to_thread(model_loader.predict, image, prompt)
+
         # Log token usage
         token_logger.log_usage(
             operation="extract",
@@ -171,10 +252,13 @@ async def extract_text(
         )
         
         return ExtractionResponse(extracted_text=extracted)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("extract failed")
+        raise HTTPException(status_code=500, detail="Extraction failed.")
 
-@app.post("/extract-batch", response_model=BatchExtractionResponse)
+@app.post("/extract-batch", response_model=BatchExtractionResponse, dependencies=[Depends(require_api_key)])
 @limiter.limit(BATCH_RATE_LIMIT)
 async def extract_text_batch(
     request: Request,
@@ -208,10 +292,10 @@ async def extract_text_batch(
                 detail=f"Mismatch: {len(files)} files but {len(id_list)} IDs provided"
             )
         
-        if len(files) > 20:
+        if len(files) > config.MAX_BATCH_IMAGES:
             raise HTTPException(
                 status_code=400,
-                detail="Maximum 20 images per batch request"
+                detail=f"Maximum {config.MAX_BATCH_IMAGES} images per batch request"
             )
         
         # Parse contexts if provided
@@ -245,11 +329,11 @@ async def extract_text_batch(
                 
                 # Generate prompt for this specific image
                 prompt = get_extraction_prompt(img_subject, img_lesson, img_docType)
-                
-                contents = await file.read()
+
+                contents = await _read_upload_validated(file, config.ALLOWED_IMAGE_TYPES, "image")
                 image = Image.open(io.BytesIO(contents))
-                extracted, usage = model_loader.predict(image, prompt)
-                
+                extracted, usage = await asyncio.to_thread(model_loader.predict, image, prompt)
+
                 # Aggregate token usage
                 total_input_tokens += usage['prompt_token_count']
                 total_output_tokens += usage['candidates_token_count']
@@ -258,11 +342,13 @@ async def extract_text_batch(
                     id=item_id,
                     extracted_text=extracted
                 ))
-            except Exception as e:
-                # Add error result but continue processing other images
+            except Exception:
+                # Log the detail server-side; return a generic per-item marker
+                # so other images still process and no internals leak.
+                logger.exception("batch item %s failed", item_id)
                 results.append(BatchExtractionItem(
                     id=item_id,
-                    extracted_text=f"[ERROR: {str(e)}]"
+                    extracted_text="[ERROR: could not process this image]"
                 ))
         
         # Log aggregated batch usage
@@ -283,8 +369,9 @@ async def extract_text_batch(
         )
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("extract-batch failed")
+        raise HTTPException(status_code=500, detail="Batch extraction failed.")
 
 
 class ParsedQuestion(BaseModel):
@@ -304,7 +391,7 @@ class PaperExtractionResponse(BaseModel):
     questionImages: Optional[List[Optional[str]]] = None  # base64 PNG - one per question (null if failed)
 
 
-@app.post("/extract-paper", response_model=PaperExtractionResponse)
+@app.post("/extract-paper", response_model=PaperExtractionResponse, dependencies=[Depends(require_api_key)])
 @limiter.limit(PAPER_RATE_LIMIT)
 async def extract_paper(
     request: Request,
@@ -334,13 +421,10 @@ async def extract_paper(
         print(f"  answerPaper: {answerPaper.filename if answerPaper else 'None'}")
         print("=" * 60)
 
-        # Read PDF bytes
-        question_bytes = await questionPaper.read()
-        
-        # Determine mime type
+        # Read + validate the question paper (size cap + PDF/image allowlist)
+        question_bytes = await _read_upload_validated(
+            questionPaper, config.ALLOWED_PAPER_TYPES, "question paper")
         q_mime = questionPaper.content_type or "application/pdf"
-        if not q_mime.startswith("application/pdf") and not q_mime.startswith("image/"):
-            raise HTTPException(status_code=400, detail="Question paper must be a PDF or image file")
 
         # Convert PDF pages to PIL images, collect text blocks and vector drawings
         page_pil_images = []    # PIL Images (RGB), one per page
@@ -385,7 +469,8 @@ async def extract_paper(
 
         answer_part = None
         if answerPaper:
-            answer_bytes = await answerPaper.read()
+            answer_bytes = await _read_upload_validated(
+                answerPaper, config.ALLOWED_PAPER_TYPES, "answer paper")
             a_mime = answerPaper.content_type or "application/pdf"
             answer_part = Part.from_data(data=answer_bytes, mime_type=a_mime)
             parts.append(answer_part)
@@ -457,8 +542,9 @@ IMPORTANT:
         print(prompt[:500] + "..." if len(prompt) > 500 else prompt)
         print("=" * 60)
 
-        # Send to Gemini
-        raw_response, usage = model_loader.predict_with_parts(parts, prompt)
+        # Send to Gemini (off the event loop — blocking SDK call)
+        raw_response, usage = await asyncio.to_thread(
+            model_loader.predict_with_parts, parts, prompt)
 
         # Log token usage
         token_logger.log_usage(
@@ -945,11 +1031,9 @@ IMPORTANT:
 
     except HTTPException:
         raise
-    except Exception as e:
-        print(f"[PAPER EXTRACTION] Error: {e}")
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("extract-paper failed")
+        raise HTTPException(status_code=500, detail="Paper extraction failed.")
 
 
 
