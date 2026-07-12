@@ -1,0 +1,70 @@
+name: Deploy Eduapp Extraction to Kubernetes
+
+on:
+  push:
+    branches:
+      - main
+      - development
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Set up Kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBE_CONFIG }}" > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Deploy to Kubernetes
+        run: |
+          deployment=""
+
+          for candidate in eduapp-extraction-deployment eduapp-extraction; do
+            if kubectl get deployment "$candidate" >/dev/null 2>&1; then
+              deployment="$candidate"
+              break
+            fi
+          done
+
+          if [ -z "$deployment" ]; then
+            echo "No expected deployment found. Checked: eduapp-extraction-deployment, eduapp-extraction"
+            kubectl get deployments
+            exit 1
+          fi
+
+          # Trigger a rolling update to pull the newly built image
+          kubectl rollout restart deployment "$deployment"
+          kubectl rollout status deployment "$deployment"
