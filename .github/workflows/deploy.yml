@@ -50,6 +50,6 @@ jobs:
 
       - name: Deploy to Kubernetes
         run: |
-          # Trigger a rolling update to pull the newly built image
-          kubectl rollout restart deployment eduapp-extraction-deployment
+          # Update the deployment to use the image tag for this specific branch (e.g., :main or :development)
+          kubectl set image deployment/eduapp-extraction-deployment eduapp-extraction=ghcr.io/sithum20041129/eduapp_extraction:${{ github.ref_name }}
           kubectl rollout status deployment eduapp-extraction-deployment
